@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
-"""pimox-builder — bake the Pimox install into a Raspberry Pi SD card.
+"""pimox-builder — bake PXVIRT (Proxmox VE for ARM) into a Raspberry Pi SD card.
 
 Flash Raspberry Pi OS Lite (64-bit) with Raspberry Pi Imager, leave the card
-plugged in, point this at the `bootfs` partition, fill in the form, hit Build.
+plugged in, point this at the boot partition, fill in the form, hit Build.
 
-It drops a first-boot script that does every step of the Pimox guide for you:
-hostname, static IP, wifi, user, then Proxmox VE on the second boot.
+It drops a first-boot script that does every step for you: hostname, static IP,
+wifi, user, the 4K-page kernel and cgroup fixes the Pi needs, then PXVIRT on
+the second boot.
 
 Run with --selftest to check the generator without an SD card.
 """
 
 import ipaddress
+import string
 import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-PVE_REPO = "https://global.mirrors.apqa.cn/proxmox/debian"
-CMDLINE_ARGS = (
+# The old pimox/pveport repo (global.mirrors.apqa.cn) is dead — jiangcuo stopped
+# distributing pveport debs and the project moved to PXVIRT. This is the live one.
+PXVIRT_REPO = "https://mirrors.lierfang.com/pxcloud/pxvirt"
+PXVIRT_KEY = f"{PXVIRT_REPO}/pveport.gpg"
+KEYRING = "/usr/share/keyrings/pxvirt.gpg"
+
+# LXC needs these or container memory/cpu accounting reads zero. They stay in
+# cmdline.txt forever, unlike the systemd.run hooks stage 1 cleans up.
+CGROUP_ARGS = "cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1"
+STAGE1_ARGS = (
     "systemd.run=/boot/firmware/firstrun.sh "
     "systemd.run_success_action=reboot "
     "systemd.unit=kernel-command-line.target"
+)
+# Pi 5 boots kernel_2712.img with 16K pages; PXVIRT needs a 4K-page kernel.
+# kernel8.img is the 4K arm64 kernel and is correct on Pi 4 too.
+CONFIG_TXT_FIX = "\n[all]\nkernel=kernel8.img\n"
+
+PACKAGES = (
+    "proxmox-ve pve-edk2-firmware-aarch64 postfix "
+    "open-iscsi chrony mmc-utils usbutils"
 )
 
 FIELDS = [
@@ -30,7 +48,7 @@ FIELDS = [
     ("dns", "DNS server", "8.8.8.8"),
     ("username", "Pi username", "pi"),
     ("password", "Pi password", ""),
-    ("root_password", "Proxmox root password", ""),
+    ("root_password", "PXVIRT root password", ""),
     ("wifi_ssid", "Wi-Fi SSID (blank = ethernet)", ""),
     ("wifi_password", "Wi-Fi password", ""),
     ("wifi_country", "Wi-Fi country code", "US"),
@@ -64,7 +82,7 @@ class Config:
 
 def validate(cfg: Config) -> list[str]:
     errs = []
-    if not cfg.hostname.replace("-", "").isalnum():
+    if not cfg.hostname or not cfg.hostname.replace("-", "").isalnum():
         errs.append("Hostname must be letters, digits and dashes only.")
     try:
         if ipaddress.ip_interface(cfg.ip).network.prefixlen == 32:
@@ -81,14 +99,14 @@ def validate(cfg: Config) -> list[str]:
     if not cfg.password:
         errs.append("Pi password is required (you need it to SSH in).")
     if not cfg.root_password:
-        errs.append("Proxmox root password is required (it's your web UI login).")
+        errs.append("PXVIRT root password is required (it's your web UI login).")
     if cfg.wifi:
         if not cfg.wifi_password:
             errs.append("Wi-Fi password is required when an SSID is set.")
         if len(cfg.wifi_country) != 2 or not cfg.wifi_country.isalpha():
             errs.append("Wi-Fi country must be a 2-letter code, e.g. US or GB.")
     for key, label, _ in FIELDS:
-        if "\n" in getattr(cfg, key) or "\r" in getattr(cfg, key):
+        if any(c in getattr(cfg, key) for c in "\r\n"):
             errs.append(f"{label} cannot contain line breaks.")
     return errs
 
@@ -127,7 +145,7 @@ def _interfaces(cfg: Config) -> str:
     if cfg.wifi:
         # ponytail: 802.11 can't be bridged, so vmbr0 is port-less and the Pi's
         # own IP stays on wlan0. VMs get an isolated bridge; add NAT/masquerade
-        # yourself if they need to reach the LAN. Wire it up for real bridging.
+        # yourself if they need the LAN, or use Ethernet for real bridging.
         return """auto lo
 iface lo inet loopback
 
@@ -153,50 +171,57 @@ iface vmbr0 inet static
 
 
 def stage2_sh(cfg: Config) -> str:
-    """Runs on the second boot, once networking is up: the actual Pimox install."""
-    handover = "" if cfg.wifi else f"""
+    """Runs on the second boot, once networking is up: the actual PXVIRT install."""
+    # Ethernet: ifupdown2 takes vmbr0, so NetworkManager has to go entirely.
+    # Wifi: NM keeps wlan0, so it stays — just tell it to leave vmbr0 alone.
+    handover = f"""
 rm -f /etc/NetworkManager/system-connections/pimox-uplink.nmconnection
 systemctl disable NetworkManager NetworkManager-wait-online || true
+systemctl stop NetworkManager || true
 rm -f /etc/resolv.conf
 echo 'nameserver {cfg.dns}' >/etc/resolv.conf
-"""
-    unmanaged = """
+""" if not cfg.wifi else """
 mkdir -p /etc/NetworkManager/conf.d
 printf '[keyfile]\\nunmanaged-devices=interface-name:vmbr0\\n' \\
     >/etc/NetworkManager/conf.d/99-pimox.conf
-""" if cfg.wifi else ""
+"""
 
     return f"""#!/bin/bash
-# generated by pimox-builder — the Pimox guide, minus the typing
+# generated by pimox-builder — docs.pxvirt.lierfang.com, minus the typing
 exec >/var/log/pimox-install.log 2>&1
 set -x
 export DEBIAN_FRONTEND=noninteractive
+# ponytail: plain `upgrade` only. full-upgrade/dist-upgrade let the PXVIRT repo
+# pull a generic kernel and drop the Pi's own — `upgrade` never removes packages.
 APT="apt-get -y -o Dpkg::Options::=--force-confold"
 
 # The unit waits for network-online, but DNS is often a beat behind it.
-for _ in $(seq 1 60); do getent hosts deb.debian.org && break; sleep 5; done
+for _ in $(seq 1 60); do getent hosts mirrors.lierfang.com && break; sleep 5; done
 
 $APT update
+$APT install curl ca-certificates
 $APT upgrade
 
-echo "deb [arch=arm64] {PVE_REPO}/pve bookworm port" >/etc/apt/sources.list.d/pveport.list
-curl -fsSL {PVE_REPO}/pveport.gpg -o /etc/apt/trusted.gpg.d/pveport.gpg || exit 1
-
+curl -fsSL {PXVIRT_KEY} -o {KEYRING} || exit 1
+. /etc/os-release
+echo "deb [arch=arm64 signed-by={KEYRING}] {PXVIRT_REPO} $VERSION_CODENAME main" \\
+    >/etc/apt/sources.list.d/pxvirt.list
 $APT update
-$APT full-upgrade
-$APT dist-upgrade
 
 debconf-set-selections <<'DEBCONF'
 postfix postfix/main_mailer_type select Local only
 postfix postfix/mailname string {cfg.hostname}.local
 DEBCONF
 
+# ifupdown2 first and on its own — it conflicts with ifupdown, and untangling
+# that mid-way through a proxmox-ve install is not a good afternoon.
 $APT install ifupdown2
-$APT install proxmox-ve postfix open-iscsi chrony mmc-utils usbutils
+rm -f /etc/network/interfaces.new
+$APT install {PACKAGES}
 
 cat >/etc/network/interfaces <<'IFACES'
 {_interfaces(cfg)}IFACES
-{handover}{unmanaged}
+{handover}
 chpasswd <<'PWEOF'
 root:{cfg.root_password}
 PWEOF
@@ -225,7 +250,7 @@ set -x
 echo '{cfg.hostname}' >/etc/hostname
 cat >/etc/hosts <<'HOSTS'
 127.0.0.1 localhost
-{cfg.addr} {cfg.hostname}
+{cfg.addr} {cfg.hostname}.local {cfg.hostname}
 ::1 localhost ip6-localhost ip6-loopback
 ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
@@ -252,7 +277,7 @@ chmod 700 /usr/local/sbin/pimox-install.sh
 
 cat >/etc/systemd/system/pimox-install.service <<'UNITEOF'
 [Unit]
-Description=Install Proxmox VE (pimox-builder)
+Description=Install PXVIRT (pimox-builder)
 After=network-online.target
 Wants=network-online.target
 
@@ -267,16 +292,27 @@ WantedBy=multi-user.target
 UNITEOF
 systemctl enable pimox-install.service
 
+# Drop our own boot hooks, keep everything else (cgroup args included).
 sed -i 's| systemd\\.[^ ]*||g' "$BOOT/cmdline.txt"
 rm -f "$BOOT/firstrun.sh"
 """
 
 
 def patch_cmdline(path: Path) -> None:
-    """Append the systemd.run hooks, idempotently."""
-    line = path.read_text(encoding="utf-8").strip()
-    line = " ".join(w for w in line.split() if not w.startswith("systemd."))
-    path.write_text(f"{line} {CMDLINE_ARGS}\n", encoding="utf-8")
+    """Add the cgroup args and the stage-1 hooks, idempotently."""
+    words = [w for w in path.read_text(encoding="utf-8").split()
+             if not w.startswith("systemd.") and not w.startswith("cgroup_")]
+    path.write_text(" ".join(words) + f" {CGROUP_ARGS} {STAGE1_ARGS}\n",
+                    encoding="utf-8", newline="\n")
+
+
+def patch_config_txt(path: Path) -> bool:
+    """Force the 4K-page kernel. Returns True if the file was changed."""
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    if "kernel=kernel8.img" in text:
+        return False
+    path.write_text(text.rstrip("\n") + CONFIG_TXT_FIX, encoding="utf-8", newline="\n")
+    return True
 
 
 def build(cfg: Config, boot: Path) -> list[str]:
@@ -289,10 +325,30 @@ def build(cfg: Config, boot: Path) -> list[str]:
     (boot / "firstrun.sh").write_text(firstrun_sh(cfg), encoding="utf-8", newline="\n")
     patch_cmdline(cmdline)
     written = ["firstrun.sh", "cmdline.txt"]
+    if patch_config_txt(boot / "config.txt"):
+        written.append("config.txt")
     if cfg.ssh:
         (boot / "ssh").write_text("", encoding="utf-8")
         written.append("ssh")
     return written
+
+
+def find_boot_partitions() -> list[Path]:
+    """Anything mounted that looks like a Pi boot partition."""
+    if sys.platform == "win32":
+        roots = [Path(f"{c}:/") for c in string.ascii_uppercase[3:]]  # skip A/B/C
+    else:
+        roots = [p for base in ("/Volumes", "/media", "/run/media")
+                 for pat in ("*", "*/*")
+                 for p in Path(base).glob(pat)]
+    found = []
+    for r in roots:
+        try:
+            if (r / "cmdline.txt").is_file():
+                found.append(r)
+        except OSError:
+            pass  # unreadable or disconnected drive
+    return found
 
 
 # --------------------------------------------------------------------------- GUI
@@ -307,7 +363,7 @@ def gui() -> None:
     frm = ttk.Frame(root, padding=12)
     frm.grid()
 
-    ttk.Label(frm, text="Proxmox on a Raspberry Pi, without the 13 steps.",
+    ttk.Label(frm, text="PXVIRT on a Raspberry Pi. Fill in, Build, boot.",
               font=("", 10, "bold")).grid(row=0, column=0, columnspan=3,
                                           sticky="w", pady=(0, 10))
 
@@ -326,15 +382,17 @@ def gui() -> None:
 
     row += 1
     ttk.Label(frm, text="Boot partition").grid(row=row, column=0, sticky="e", padx=(0, 8))
-    boot_var = tk.StringVar()
+    detected = find_boot_partitions()
+    boot_var = tk.StringVar(value=str(detected[0]) if detected else "")
     ttk.Entry(frm, textvariable=boot_var, width=24).grid(row=row, column=1, sticky="we")
     ttk.Button(frm, text="Browse…",
                command=lambda: boot_var.set(filedialog.askdirectory() or boot_var.get())
                ).grid(row=row, column=2, sticky="we", padx=(6, 0))
 
     row += 1
-    status = ttk.Label(frm, text="Flash Raspberry Pi OS Lite 64-bit first, then point me at bootfs.",
-                       wraplength=380, foreground="grey30")
+    hint = (f"Found a Pi boot partition at {detected[0]}." if detected else
+            "Flash Raspberry Pi OS Lite 64-bit first, then point me at bootfs.")
+    status = ttk.Label(frm, text=hint, wraplength=380, foreground="grey30")
     status.grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 6))
 
     def on_build():
@@ -352,7 +410,7 @@ def gui() -> None:
             messagebox.showerror("Build failed", str(exc))
             return
         status.config(text=f"Wrote {', '.join(written)}. Eject the card, boot the Pi, "
-                           f"then wait ~30 min. Proxmox lands at https://{cfg.addr}:8006",
+                           f"then wait ~30 min. PXVIRT lands at https://{cfg.addr}:8006",
                       foreground="green4")
 
     row += 1
@@ -374,25 +432,41 @@ def selftest() -> None:
     s = firstrun_sh(cfg)
     assert "p'w$1" in s and "bridge-ports none" in s  # secrets literal, wifi bridge
     assert s.count("STAGE2EOF") == 2 and "pimox-install.service" in s
-    assert 'psk=hunter2' in s and "do_wifi_country US" in s
+    assert "psk=hunter2" in s and "do_wifi_country US" in s
     # stage 1 must strip systemd.unit= too, or the Pi reboots into a bare target
     assert r"'s| systemd\.[^ ]*||g'" in s
+    assert "cgroup_" not in s.split("sed -i")[1]  # ...but must not eat cgroup args
 
     wired = Config(password="a", root_password="b")
     assert "bridge-ports eth0" in firstrun_sh(wired)
-    assert "systemctl disable NetworkManager" in stage2_sh(wired)
-    assert "systemctl disable NetworkManager" not in stage2_sh(cfg)
+    s2, s2w = stage2_sh(wired), stage2_sh(cfg)
+    assert "systemctl disable NetworkManager" in s2
+    assert "systemctl disable NetworkManager" not in s2w
+    assert "unmanaged-devices=interface-name:vmbr0" in s2w
+    assert "mirrors.lierfang.com" in s2 and "apqa.cn" not in s2  # dead mirror gone
+    assert "$VERSION_CODENAME" in s2 and f"signed-by={KEYRING}" in s2
+    assert "$APT full-upgrade" not in s2 and "$APT dist-upgrade" not in s2
+    assert "pve-edk2-firmware-aarch64" in s2
 
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         boot = Path(d)
-        (boot / "cmdline.txt").write_text("console=serial0 rootwait systemd.run=/old.sh\n")
-        build(wired, boot)
+        (boot / "cmdline.txt").write_text(
+            "console=serial0 rootwait systemd.run=/old.sh cgroup_enable=memory\n")
+        (boot / "config.txt").write_text("[pi5]\ndtparam=nvme\n")
+        assert set(build(wired, boot)) == {"firstrun.sh", "cmdline.txt", "config.txt", "ssh"}
         line = (boot / "cmdline.txt").read_text()
         assert "/old.sh" not in line and line.count("systemd.run=") == 1
-        build(wired, boot)  # idempotent
+        assert line.count("cgroup_enable=memory") == 1 and "cgroup_enable=cpuset" in line
+        cfgtxt = (boot / "config.txt").read_text()
+        # [all] resets the model filter, else kernel= would only apply to [pi5]
+        assert cfgtxt.endswith("[all]\nkernel=kernel8.img\n") and "dtparam=nvme" in cfgtxt
+
+        assert build(wired, boot) == ["firstrun.sh", "cmdline.txt", "ssh"]  # idempotent
         assert (boot / "cmdline.txt").read_text() == line
-        assert (boot / "ssh").exists()
+        assert (boot / "config.txt").read_text() == cfgtxt
+
+        assert boot in find_boot_partitions() or sys.platform == "win32"
     print("selftest ok")
 
 
