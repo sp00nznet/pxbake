@@ -453,12 +453,33 @@ def write_sync(path: Path, text: str) -> None:
         os.fsync(f.fileno())
 
 
+def is_raspios(boot: Path) -> bool:
+    """Raspberry Pi OS specifically, not just any Pi-bootable card.
+
+    pi-gen stamps issue.txt with "Raspberry Pi reference". LibreELEC, RetroPie,
+    Ubuntu and friends all ship a cmdline.txt too, and everything pxbake writes
+    (systemd.run, useradd, apt) assumes Debian — so cmdline.txt alone is not
+    enough to tell them apart."""
+    try:
+        return "Raspberry Pi reference" in (boot / "issue.txt").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
 def build(cfg: Config, boot: Path) -> list[str]:
     cmdline = boot / "cmdline.txt"
     if not cmdline.exists():
         raise FileNotFoundError(
             f"No cmdline.txt in {boot} — that's not a Raspberry Pi boot partition.\n"
             "Pick the small FAT32 one (usually labelled 'bootfs')."
+        )
+    if not is_raspios(boot):
+        raise OSError(
+            f"{boot} is a Pi boot partition, but not Raspberry Pi OS — no\n"
+            "'Raspberry Pi reference' in issue.txt. LibreELEC, RetroPie and Ubuntu\n"
+            "all look like this, and everything pxbake writes assumes Debian.\n"
+            "Pick the whole disk instead to erase it and install Raspberry Pi OS."
         )
     write_sync(boot / "firstrun.sh", firstrun_sh(cfg))
     patch_cmdline(cmdline)
@@ -682,7 +703,7 @@ class Target:
 
 def list_targets() -> list[Target]:
     targets = [Target(f"{p}  —  flashed card, write config only", boot=p)
-               for p in find_boot_partitions()]
+               for p in find_boot_partitions() if is_raspios(p)]
     for d in list_disks():
         gb = round(d["Size"] / 1e9, 1)
         targets.append(Target(
@@ -984,6 +1005,18 @@ def selftest() -> None:
         (boot / "cmdline.txt").write_text(
             "console=serial0 rootwait systemd.run=/old.sh cgroup_enable=memory\n")
         (boot / "config.txt").write_text("[pi5]\ndtparam=nvme\n")
+
+        # a cmdline.txt is not proof of Raspberry Pi OS — LibreELEC has one too,
+        # and writing a Debian firstrun.sh onto it just breaks someone's Kodi box
+        assert not is_raspios(boot)
+        try:
+            build(wired, boot)
+            raise AssertionError("should refuse a non-Raspberry-Pi-OS partition")
+        except OSError as exc:
+            assert "not Raspberry Pi OS" in str(exc), exc
+        (boot / "issue.txt").write_text(
+            "Raspberry Pi reference 2026-06-18\nGenerated using pi-gen\n")
+        assert is_raspios(boot)
         assert set(build(wired, boot)) == {"firstrun.sh", "cmdline.txt",
                                            "config.txt", "ssh"}
         line = (boot / "cmdline.txt").read_text()
