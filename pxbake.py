@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+"""pxbake — bake PXVIRT (Proxmox VE for ARM) into a Raspberry Pi SD card.
+
+Pick a card, fill in the form, hit Bake. It downloads Raspberry Pi OS Lite,
+writes it to the card, and drops a first-boot script that turns the Pi into a
+PXVIRT node without you ever opening an SSH session.
+
+Already flashed a card yourself? Pick its boot partition instead and it just
+writes the config.
+
+Run with --selftest to check the generator without touching any hardware.
+"""
+
+import hashlib
+import ipaddress
+import json
+import lzma
+import os
+import queue
+import string
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# The old pimox/pveport repo (global.mirrors.apqa.cn) is gone — its packages were
+# retired when Proxmox-Port became PXVIRT. This is the current one.
+PXVIRT_REPO = "https://mirrors.lierfang.com/pxcloud/pxvirt"
+PXVIRT_KEY = f"{PXVIRT_REPO}/pveport.gpg"
+KEYRING = "/usr/share/keyrings/pxvirt.gpg"
+
+RPIOS_URL = "https://downloads.raspberrypi.com/raspios_lite_arm64_latest"
+RPIOS_SHA_URL = f"{RPIOS_URL}.sha256"
+
+# LXC needs these or container memory/cpu accounting reads zero. They stay in
+# cmdline.txt forever, unlike the systemd.run hooks stage 1 cleans up.
+CGROUP_ARGS = "cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1"
+STAGE1_ARGS = (
+    "systemd.run=/boot/firmware/firstrun.sh "
+    "systemd.run_success_action=reboot "
+    "systemd.unit=kernel-command-line.target"
+)
+# Pi 5 boots kernel_2712.img with 16K pages; PXVIRT needs a 4K-page kernel.
+# kernel8.img is the 4K arm64 kernel and is correct on Pi 4 too.
+CONFIG_TXT_FIX = "\n[all]\nkernel=kernel8.img\n"
+
+PACKAGES = (
+    "proxmox-ve pve-edk2-firmware-aarch64 postfix "
+    "open-iscsi chrony mmc-utils usbutils"
+)
+
+FIELDS = [
+    ("hostname", "Hostname", "pxvirt"),
+    ("ip", "Static IP / CIDR", "192.168.0.50/24"),
+    ("gateway", "Gateway", "192.168.0.1"),
+    ("dns", "DNS server", "8.8.8.8"),
+    ("username", "Pi username", "pi"),
+    ("password", "Pi password", ""),
+    ("root_password", "PXVIRT root password", ""),
+    ("wifi_ssid", "Wi-Fi SSID (blank = ethernet)", ""),
+    ("wifi_password", "Wi-Fi password", ""),
+    ("wifi_country", "Wi-Fi country code", "US"),
+]
+SECRET_FIELDS = {"password", "root_password", "wifi_password"}
+
+CHUNK = 4 << 20
+SECTOR = 512
+
+
+@dataclass
+class Config:
+    hostname: str = "pxvirt"
+    ip: str = "192.168.0.50/24"
+    gateway: str = "192.168.0.1"
+    dns: str = "8.8.8.8"
+    username: str = "pi"
+    password: str = ""
+    root_password: str = ""
+    wifi_ssid: str = ""
+    wifi_password: str = ""
+    wifi_country: str = "US"
+    ssh: bool = True
+    conn_uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+    @property
+    def wifi(self) -> bool:
+        return bool(self.wifi_ssid)
+
+    @property
+    def addr(self) -> str:
+        return str(ipaddress.ip_interface(self.ip).ip)
+
+
+def validate(cfg: Config) -> list[str]:
+    errs = []
+    if not cfg.hostname or not cfg.hostname.replace("-", "").isalnum():
+        errs.append("Hostname must be letters, digits and dashes only.")
+    try:
+        if ipaddress.ip_interface(cfg.ip).network.prefixlen == 32:
+            errs.append("Static IP needs a prefix, e.g. 192.168.0.50/24")
+    except ValueError:
+        errs.append("Static IP must look like 192.168.0.50/24")
+    for name, val in (("Gateway", cfg.gateway), ("DNS server", cfg.dns)):
+        try:
+            ipaddress.ip_address(val)
+        except ValueError:
+            errs.append(f"{name} must be a plain IP address.")
+    if not cfg.username.isalnum() or cfg.username == "root":
+        errs.append("Username must be alphanumeric and not 'root'.")
+    if not cfg.password:
+        errs.append("Pi password is required (you need it to SSH in).")
+    if not cfg.root_password:
+        errs.append("PXVIRT root password is required (it's your web UI login).")
+    if cfg.wifi:
+        if not cfg.wifi_password:
+            errs.append("Wi-Fi password is required when an SSID is set.")
+        if len(cfg.wifi_country) != 2 or not cfg.wifi_country.isalpha():
+            errs.append("Wi-Fi country must be a 2-letter code, e.g. US or GB.")
+    for key, label, _ in FIELDS:
+        if any(c in getattr(cfg, key) for c in "\r\n"):
+            errs.append(f"{label} cannot contain line breaks.")
+    return errs
+
+
+# ------------------------------------------------------------------ generation
+
+def _nm_connection(cfg: Config) -> str:
+    """NetworkManager keyfile for the uplink. Stage 2 hands ethernet over to
+    ifupdown2/vmbr0; on wifi NetworkManager keeps the link for good."""
+    head = f"""[connection]
+id=pxbake-uplink
+uuid={cfg.conn_uuid}
+interface-name={'wlan0' if cfg.wifi else 'eth0'}
+type={'wifi' if cfg.wifi else 'ethernet'}
+autoconnect=true
+"""
+    wifi = f"""
+[wifi]
+mode=infrastructure
+ssid={cfg.wifi_ssid}
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk={cfg.wifi_password}
+""" if cfg.wifi else ""
+    return head + wifi + f"""
+[ipv4]
+method=manual
+address1={cfg.ip},{cfg.gateway}
+dns={cfg.dns};
+
+[ipv6]
+method=disabled
+"""
+
+
+def _interfaces(cfg: Config) -> str:
+    if cfg.wifi:
+        # ponytail: vmbr0 has no ports on wifi. A station-mode 802.11 link can't
+        # carry other MACs — infrastructure data frames have three address fields
+        # and no room for the original source, so the AP can't route replies to a
+        # MAC that never associated. AP mode bridges fine; client mode needs
+        # 4-address/WDS (`iw dev wlan0 set 4addr on`) and an AP that supports it.
+        # Upgrade path if yours does: set 4addr and put wlan0 in bridge-ports.
+        return """auto lo
+iface lo inet loopback
+
+auto vmbr0
+iface vmbr0 inet manual
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+"""
+    return f"""auto lo
+iface lo inet loopback
+
+iface eth0 inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+    address {cfg.ip}
+    gateway {cfg.gateway}
+    bridge-ports eth0
+    bridge-stp off
+    bridge-fd 0
+"""
+
+
+def stage2_sh(cfg: Config) -> str:
+    """Runs on the second boot, once networking is up: the actual PXVIRT install."""
+    # Ethernet: ifupdown2 takes vmbr0, so NetworkManager has to go entirely.
+    # Wifi: NM keeps wlan0, so it stays — just tell it to leave vmbr0 alone.
+    handover = f"""
+rm -f /etc/NetworkManager/system-connections/pxbake-uplink.nmconnection
+systemctl disable NetworkManager NetworkManager-wait-online || true
+systemctl stop NetworkManager || true
+rm -f /etc/resolv.conf
+echo 'nameserver {cfg.dns}' >/etc/resolv.conf
+""" if not cfg.wifi else """
+mkdir -p /etc/NetworkManager/conf.d
+printf '[keyfile]\\nunmanaged-devices=interface-name:vmbr0\\n' \\
+    >/etc/NetworkManager/conf.d/99-pxbake.conf
+"""
+
+    return f"""#!/bin/bash
+# generated by pxbake — docs.pxvirt.lierfang.com, minus the typing
+exec >/var/log/pxbake-install.log 2>&1
+set -x
+export DEBIAN_FRONTEND=noninteractive
+# ponytail: plain `upgrade` only. full-upgrade/dist-upgrade let the PXVIRT repo
+# pull a generic kernel and drop the Pi's own — `upgrade` never removes packages.
+APT="apt-get -y -o Dpkg::Options::=--force-confold"
+
+# The unit waits for network-online, but DNS is often a beat behind it.
+for _ in $(seq 1 60); do getent hosts mirrors.lierfang.com && break; sleep 5; done
+
+$APT update
+$APT install curl ca-certificates
+$APT upgrade
+
+curl -fsSL {PXVIRT_KEY} -o {KEYRING} || exit 1
+. /etc/os-release
+echo "deb [arch=arm64 signed-by={KEYRING}] {PXVIRT_REPO} $VERSION_CODENAME main" \\
+    >/etc/apt/sources.list.d/pxvirt.list
+$APT update
+
+debconf-set-selections <<'DEBCONF'
+postfix postfix/main_mailer_type select Local only
+postfix postfix/mailname string {cfg.hostname}.local
+DEBCONF
+
+# ifupdown2 first and on its own — it conflicts with ifupdown, and untangling
+# that mid-way through a proxmox-ve install is not a good afternoon.
+$APT install ifupdown2
+rm -f /etc/network/interfaces.new
+$APT install {PACKAGES}
+
+cat >/etc/network/interfaces <<'IFACES'
+{_interfaces(cfg)}IFACES
+{handover}
+chpasswd <<'PWEOF'
+root:{cfg.root_password}
+PWEOF
+
+systemctl disable pxbake-install.service
+rm -f /etc/systemd/system/pxbake-install.service "$0"
+systemctl reboot
+"""
+
+
+def firstrun_sh(cfg: Config) -> str:
+    """Runs on the first boot in a minimal systemd target: local config only."""
+    wifi_bits = f"""
+rfkill unblock wifi || true
+raspi-config nonint do_wifi_country {cfg.wifi_country.upper()} || true
+""" if cfg.wifi else ""
+    ssh_bits = "systemctl enable ssh\n" if cfg.ssh else ""
+
+    return f"""#!/bin/bash
+# generated by pxbake — stage 1, deletes itself when done
+BOOT=/boot/firmware
+[ -d "$BOOT" ] || BOOT=/boot
+exec >"$BOOT/pxbake-stage1.log" 2>&1
+set -x
+
+echo '{cfg.hostname}' >/etc/hostname
+cat >/etc/hosts <<'HOSTS'
+127.0.0.1 localhost
+{cfg.addr} {cfg.hostname}.local {cfg.hostname}
+::1 localhost ip6-localhost ip6-loopback
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+HOSTS
+
+id -u '{cfg.username}' >/dev/null 2>&1 || \\
+    useradd -m -s /bin/bash -G sudo,adm,dialout,video,plugdev,users '{cfg.username}'
+chpasswd <<'PWEOF'
+{cfg.username}:{cfg.password}
+PWEOF
+echo '{cfg.username} ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/010-pxbake-nopasswd
+chmod 440 /etc/sudoers.d/010-pxbake-nopasswd
+systemctl disable userconfig.service || true
+rm -f /etc/ssh/sshd_config.d/rename_user.conf
+{ssh_bits}
+mkdir -p /etc/NetworkManager/system-connections
+cat >/etc/NetworkManager/system-connections/pxbake-uplink.nmconnection <<'NMEOF'
+{_nm_connection(cfg)}NMEOF
+chmod 600 /etc/NetworkManager/system-connections/pxbake-uplink.nmconnection
+{wifi_bits}
+cat >/usr/local/sbin/pxbake-install.sh <<'STAGE2EOF'
+{stage2_sh(cfg)}STAGE2EOF
+chmod 700 /usr/local/sbin/pxbake-install.sh
+
+cat >/etc/systemd/system/pxbake-install.service <<'UNITEOF'
+[Unit]
+Description=Install PXVIRT (pxbake)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pxbake-install.sh
+TimeoutStartSec=0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+systemctl enable pxbake-install.service
+
+# Drop our own boot hooks, keep everything else (cgroup args included).
+sed -i 's| systemd\\.[^ ]*||g' "$BOOT/cmdline.txt"
+rm -f "$BOOT/firstrun.sh"
+"""
+
+
+def patch_cmdline(path: Path) -> None:
+    """Add the cgroup args and the stage-1 hooks, idempotently."""
+    words = [w for w in path.read_text(encoding="utf-8").split()
+             if not w.startswith("systemd.") and not w.startswith("cgroup_")]
+    path.write_text(" ".join(words) + f" {CGROUP_ARGS} {STAGE1_ARGS}\n",
+                    encoding="utf-8", newline="\n")
+
+
+def patch_config_txt(path: Path) -> bool:
+    """Force the 4K-page kernel. Returns True if the file was changed."""
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    if "kernel=kernel8.img" in text:
+        return False
+    path.write_text(text.rstrip("\n") + CONFIG_TXT_FIX, encoding="utf-8", newline="\n")
+    return True
+
+
+def build(cfg: Config, boot: Path) -> list[str]:
+    cmdline = boot / "cmdline.txt"
+    if not cmdline.exists():
+        raise FileNotFoundError(
+            f"No cmdline.txt in {boot} — that's not a Raspberry Pi boot partition.\n"
+            "Pick the small FAT32 one (usually labelled 'bootfs')."
+        )
+    (boot / "firstrun.sh").write_text(firstrun_sh(cfg), encoding="utf-8", newline="\n")
+    patch_cmdline(cmdline)
+    written = ["firstrun.sh", "cmdline.txt"]
+    if patch_config_txt(boot / "config.txt"):
+        written.append("config.txt")
+    if cfg.ssh:
+        (boot / "ssh").write_text("", encoding="utf-8")
+        written.append("ssh")
+    return written
+
+
+# ----------------------------------------------------------------- image + disk
+
+def cache_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or (Path.home() / ".cache")
+    d = Path(base) / "pxbake"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _ps(script: str) -> str:
+    """Run PowerShell and return stdout. Windows disk plumbing only."""
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, check=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    ).stdout
+
+
+def parse_disks(raw: str) -> list[dict]:
+    """Removable disks only, from Get-Disk JSON. Split out so it's testable."""
+    if not raw.strip():
+        return []
+    data = json.loads(raw)
+    if isinstance(data, dict):
+        data = [data]
+    return [d for d in data
+            if d.get("BusType") in ("USB", "SD", "MMC")
+            and not d.get("IsSystem") and not d.get("IsBoot")]
+
+
+def list_disks() -> list[dict]:
+    if sys.platform != "win32":
+        return []  # ponytail: enumeration is Windows-only; elsewhere type a device path
+    try:
+        return parse_disks(_ps(
+            "Get-Disk | Select-Object Number,FriendlyName,Size,BusType,IsSystem,"
+            "IsBoot | ConvertTo-Json -Compress"))
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
+        return []
+
+
+def find_boot_partitions() -> list[Path]:
+    """Anything mounted that looks like a Pi boot partition."""
+    if sys.platform == "win32":
+        roots = [Path(f"{c}:/") for c in string.ascii_uppercase[3:]]  # skip A/B/C
+    else:
+        roots = [p for base in ("/Volumes", "/media", "/run/media")
+                 for pat in ("*", "*/*")
+                 for p in Path(base).glob(pat)]
+    found = []
+    for r in roots:
+        try:
+            if (r / "cmdline.txt").is_file():
+                found.append(r)
+        except OSError:
+            pass  # unreadable or disconnected drive
+    return found
+
+
+def is_admin() -> bool:
+    if sys.platform != "win32":
+        return os.geteuid() == 0
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def download_image(progress) -> Path:
+    """Fetch Raspberry Pi OS Lite arm64, cached and checksum-verified."""
+    sha_line = urllib.request.urlopen(RPIOS_SHA_URL, timeout=60).read().decode()
+    expected, name = sha_line.split()[0], sha_line.split()[1].strip("*")
+    dest = cache_dir() / name
+
+    if dest.exists() and _sha256(dest, progress, "verifying cached") == expected:
+        progress(f"Using cached {name}")
+        return dest
+
+    progress(f"Downloading {name}")
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with urllib.request.urlopen(RPIOS_URL, timeout=60) as r, open(tmp, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        while chunk := r.read(CHUNK):
+            f.write(chunk)
+            done += len(chunk)
+            progress(f"Downloading {done >> 20} / {total >> 20} MB",
+                     done / total if total else None)
+
+    if _sha256(tmp, progress, "verifying") != expected:
+        tmp.unlink()
+        raise OSError("Downloaded image failed its SHA-256 check. Try again.")
+    tmp.replace(dest)
+    return dest
+
+
+def _sha256(path: Path, progress, label: str) -> str:
+    h = hashlib.sha256()
+    total, done = path.stat().st_size, 0
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK):
+            h.update(chunk)
+            done += len(chunk)
+            progress(f"{label} ({done >> 20} / {total >> 20} MB)", done / total)
+    return h.hexdigest()
+
+
+def wipe_disk(number: int) -> None:
+    """Clear the partition table so Windows releases every volume on the disk.
+
+    `diskpart clean` rather than Clear-Disk: it works on RAW and uninitialised
+    disks too, which Clear-Disk refuses."""
+    script = cache_dir() / "clean.txt"
+    script.write_text(f"select disk {number}\nclean\n", encoding="ascii")
+    subprocess.run(["diskpart", "/s", str(script)], capture_output=True,
+                   text=True, check=True,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    script.unlink(missing_ok=True)
+
+
+def write_image(img_xz: Path, device: str, progress) -> None:
+    """Stream-decompress the .img.xz straight onto the raw device."""
+    written = 0
+    with lzma.open(img_xz, "rb") as src, open(device, "rb+", buffering=0) as dst:
+        while chunk := src.read(CHUNK):
+            if len(chunk) % SECTOR:  # raw device writes must be sector-aligned
+                chunk += b"\0" * (SECTOR - len(chunk) % SECTOR)
+            dst.write(chunk)
+            written += len(chunk)
+            progress(f"Writing {written >> 20} MB")
+        dst.flush()
+        os.fsync(dst.fileno())
+    progress(f"Wrote {written >> 20} MB")
+
+
+def wait_for_boot_partition(before: set, timeout: int = 90, poll=None) -> Path:
+    """After flashing, wait for the OS to mount the new bootfs."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for p in find_boot_partitions():
+            if p not in before:
+                return p
+        if poll:
+            poll()
+        time.sleep(2)
+    raise TimeoutError(
+        "The card was written, but its boot partition never appeared.\n"
+        "Re-plug the card, then run pxbake again and pick the boot partition.")
+
+
+def bake(cfg: Config, number: int, progress) -> Path:
+    """Download, flash, configure. Destroys everything on the chosen disk."""
+    if not is_admin():
+        raise PermissionError(
+            "Writing a raw disk needs Administrator. Right-click pxbake and "
+            "'Run as administrator', or pick an already-flashed boot partition.")
+    img = download_image(progress)
+    before = set(find_boot_partitions())
+    progress(f"Erasing disk {number}")
+    wipe_disk(number)
+    write_image(img, rf"\\.\PhysicalDrive{number}", progress)
+    progress("Waiting for the card to remount")
+    _ps("Update-HostStorageCache")
+    boot = wait_for_boot_partition(before)
+    progress(f"Writing config to {boot}")
+    build(cfg, boot)
+    return boot
+
+
+# --------------------------------------------------------------------------- GUI
+
+@dataclass
+class Target:
+    label: str
+    boot: Path | None = None
+    disk: int | None = None
+
+
+def list_targets() -> list[Target]:
+    targets = [Target(f"{p}  —  flashed card, write config only", boot=p)
+               for p in find_boot_partitions()]
+    for d in list_disks():
+        gb = round(d["Size"] / 1e9, 1)
+        targets.append(Target(
+            f"Disk {d['Number']}  —  {d['FriendlyName'].strip()}, {gb} GB  "
+            f"—  ERASE and bake", disk=d["Number"]))
+    return targets
+
+
+def gui() -> None:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    root = tk.Tk()
+    root.title("pxbake")
+    root.resizable(False, False)
+    frm = ttk.Frame(root, padding=12)
+    frm.grid()
+
+    ttk.Label(frm, text="PXVIRT on a Raspberry Pi. Fill in, bake, boot.",
+              font=("", 10, "bold")).grid(row=0, column=0, columnspan=2,
+                                          sticky="w", pady=(0, 10))
+
+    entries = {}
+    for i, (key, label, default) in enumerate(FIELDS, start=1):
+        ttk.Label(frm, text=label).grid(row=i, column=0, sticky="e", padx=(0, 8), pady=2)
+        e = ttk.Entry(frm, width=38, show="*" if key in SECRET_FIELDS else "")
+        e.insert(0, default)
+        e.grid(row=i, column=1, sticky="we", pady=2)
+        entries[key] = e
+
+    row = len(FIELDS) + 1
+    ssh_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(frm, text="Enable SSH", variable=ssh_var).grid(
+        row=row, column=1, sticky="w", pady=(6, 2))
+
+    row += 1
+    ttk.Label(frm, text="Target").grid(row=row, column=0, sticky="e", padx=(0, 8))
+    targets = list_targets()
+    combo = ttk.Combobox(frm, width=36, state="readonly",
+                         values=[t.label for t in targets])
+    if targets:
+        combo.current(0)
+    combo.grid(row=row, column=1, sticky="we", pady=2)
+
+    row += 1
+    refresh = ttk.Button(frm, text="Rescan")
+    refresh.grid(row=row, column=1, sticky="w", pady=(2, 0))
+
+    row += 1
+    bar = ttk.Progressbar(frm, mode="determinate", length=340)
+    bar.grid(row=row, column=0, columnspan=2, sticky="we", pady=(10, 4))
+
+    row += 1
+    status = ttk.Label(frm, text="Insert a card, or pick a flashed one.",
+                       wraplength=420, foreground="grey30")
+    status.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+    row += 1
+    bake_btn = ttk.Button(frm, text="Bake")
+    bake_btn.grid(row=row, column=0, columnspan=2, sticky="we", pady=(4, 0))
+
+    events: queue.Queue = queue.Queue()
+
+    def on_refresh():
+        nonlocal targets
+        targets = list_targets()
+        combo["values"] = [t.label for t in targets]
+        if targets:
+            combo.current(0)
+        status.config(text=f"Found {len(targets)} target(s).", foreground="grey30")
+
+    refresh.config(command=on_refresh)
+
+    def pump():
+        """Drain worker events on the Tk thread. Tk is not thread-safe."""
+        try:
+            while True:
+                kind, text, frac = events.get_nowait()
+                status.config(text=text,
+                              foreground={"err": "red3", "done": "green4"}.get(kind, "grey30"))
+                if frac is None:
+                    bar.config(mode="indeterminate")
+                    bar.start(15)
+                else:
+                    bar.stop()
+                    bar.config(mode="determinate", value=frac * 100)
+                if kind in ("done", "err"):
+                    bar.stop()
+                    bar.config(mode="determinate", value=100 if kind == "done" else 0)
+                    bake_btn.config(state="normal")
+                    refresh.config(state="normal")
+                    on_refresh()
+        except queue.Empty:
+            pass
+        root.after(100, pump)
+
+    def on_bake():
+        if not targets:
+            messagebox.showerror("No target", "No card found. Insert one and Rescan.")
+            return
+        cfg = Config(ssh=ssh_var.get(),
+                     **{k: entries[k].get().strip() for k, _, _ in FIELDS})
+        if errs := validate(cfg):
+            messagebox.showerror("Fix these first", "\n".join(f"• {e}" for e in errs))
+            return
+        target = targets[combo.current()]
+
+        if target.boot is not None:
+            try:
+                written = build(cfg, target.boot)
+            except OSError as exc:
+                messagebox.showerror("Bake failed", str(exc))
+                return
+            status.config(text=f"Wrote {', '.join(written)}. Eject, boot the Pi, "
+                               f"then https://{cfg.addr}:8006", foreground="green4")
+            return
+
+        if not messagebox.askyesno(
+                "Erase this disk?",
+                f"{target.label}\n\nEverything on it will be destroyed, then "
+                f"Raspberry Pi OS is written and configured.\n\nContinue?"):
+            return
+
+        bake_btn.config(state="disabled")
+        refresh.config(state="disabled")
+
+        def progress(text, frac=None):
+            events.put(("info", text, frac))
+
+        def worker():
+            try:
+                bake(cfg, target.disk, progress)
+                events.put(("done", f"Done. Eject the card, boot the Pi, wait ~30 min, "
+                                    f"then https://{cfg.addr}:8006", 1.0))
+            except Exception as exc:
+                events.put(("err", f"{type(exc).__name__}: {exc}", 0.0))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    bake_btn.config(command=on_bake)
+    root.after(100, pump)
+    root.mainloop()
+
+
+# ---------------------------------------------------------------------- selftest
+
+def selftest() -> None:
+    cfg = Config(password="p'w$1", root_password="r\"t", wifi_ssid="my net",
+                 wifi_password="hunter2")
+    assert validate(cfg) == [], validate(cfg)
+    assert validate(Config(ip="192.168.0.50", password="a", root_password="b"))
+    assert validate(Config(password="", root_password="b"))
+    assert validate(Config(hostname="pi mox", password="a", root_password="b"))
+    assert validate(Config(wifi_ssid="x", wifi_password="y", wifi_country="USA",
+                           password="a", root_password="b"))
+
+    s = firstrun_sh(cfg)
+    assert "p'w$1" in s and "bridge-ports none" in s  # secrets literal, wifi bridge
+    assert s.count("STAGE2EOF") == 2 and "pxbake-install.service" in s
+    assert "psk=hunter2" in s and "do_wifi_country US" in s
+    # stage 1 must strip systemd.unit= too, or the Pi reboots into a bare target
+    assert r"'s| systemd\.[^ ]*||g'" in s
+    assert "cgroup_" not in s.split("sed -i")[1]  # ...but must not eat cgroup args
+    assert "pimox" not in s and "Pimox" not in s  # renamed everywhere
+
+    wired = Config(password="a", root_password="b")
+    assert "bridge-ports eth0" in firstrun_sh(wired)
+    s2, s2w = stage2_sh(wired), stage2_sh(cfg)
+    assert "systemctl disable NetworkManager" in s2
+    assert "systemctl disable NetworkManager" not in s2w
+    assert "unmanaged-devices=interface-name:vmbr0" in s2w
+    assert "mirrors.lierfang.com" in s2 and "apqa.cn" not in s2
+    assert "$VERSION_CODENAME" in s2 and f"signed-by={KEYRING}" in s2
+    assert "$APT full-upgrade" not in s2 and "$APT dist-upgrade" not in s2
+    assert "pve-edk2-firmware-aarch64" in s2
+
+    # never offer the disk Windows is running from
+    disks = parse_disks(json.dumps([
+        {"Number": 0, "FriendlyName": "NVMe", "Size": 1e12, "BusType": "NVMe",
+         "IsSystem": True, "IsBoot": True},
+        {"Number": 1, "FriendlyName": "SanDisk", "Size": 3e10, "BusType": "USB",
+         "IsSystem": False, "IsBoot": False},
+        {"Number": 2, "FriendlyName": "USB but booted", "Size": 3e10,
+         "BusType": "USB", "IsSystem": False, "IsBoot": True},
+    ]))
+    assert [d["Number"] for d in disks] == [1], disks
+    assert parse_disks("") == []
+    assert parse_disks(json.dumps({"Number": 3, "FriendlyName": "Lone SD",
+                                   "Size": 1e10, "BusType": "SD"}))  # single = dict
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        boot = Path(d)
+        (boot / "cmdline.txt").write_text(
+            "console=serial0 rootwait systemd.run=/old.sh cgroup_enable=memory\n")
+        (boot / "config.txt").write_text("[pi5]\ndtparam=nvme\n")
+        assert set(build(wired, boot)) == {"firstrun.sh", "cmdline.txt",
+                                           "config.txt", "ssh"}
+        line = (boot / "cmdline.txt").read_text()
+        assert "/old.sh" not in line and line.count("systemd.run=") == 1
+        assert line.count("cgroup_enable=memory") == 1 and "cgroup_enable=cpuset" in line
+        cfgtxt = (boot / "config.txt").read_text()
+        # [all] resets the model filter, else kernel= would only apply to [pi5]
+        assert cfgtxt.endswith("[all]\nkernel=kernel8.img\n") and "dtparam=nvme" in cfgtxt
+
+        assert build(wired, boot) == ["firstrun.sh", "cmdline.txt", "ssh"]  # idempotent
+        assert (boot / "cmdline.txt").read_text() == line
+        assert (boot / "config.txt").read_text() == cfgtxt
+
+        # the new-partition wait must ignore partitions that were already there
+        try:
+            wait_for_boot_partition({boot}, timeout=1)
+            raise AssertionError("should have timed out on a known partition")
+        except TimeoutError:
+            pass
+    print("selftest ok")
+
+
+if __name__ == "__main__":
+    selftest() if "--selftest" in sys.argv else gui()
