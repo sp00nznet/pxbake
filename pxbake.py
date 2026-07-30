@@ -643,16 +643,53 @@ def wipe_disk(number: int) -> None:
     script.unlink(missing_ok=True)
 
 
+def verify_config(cfg: Config, boot: Path) -> None:
+    """Read back what build() wrote. Cheap, and the difference between a card
+    that boots and one that silently doesn't."""
+    want = firstrun_sh(cfg)
+    got = (boot / "firstrun.sh").read_text(encoding="utf-8", errors="replace")
+    cmdline = (boot / "cmdline.txt").read_text(encoding="utf-8", errors="replace")
+    if got != want or CGROUP_ARGS not in cmdline or "systemd.run=" not in cmdline:
+        raise OSError(
+            f"Wrote the config to {boot}, but reading it back gave something "
+            f"else.\nThe card did not store what we sent it — re-seat it and "
+            f"bake again;\nif it repeats, the card is failing.")
+
+
 def write_image(img_xz: Path, device: str, progress) -> None:
-    """Stream-decompress the .img.xz straight onto the raw device."""
-    written = 0
+    """Stream-decompress the .img.xz straight onto the raw device.
+
+    Sector 0 goes on last, deliberately. The image's partition table lives in the
+    first 512 bytes, so writing it first lets Windows re-detect the layout and
+    auto-mount bootfs seconds into a multi-minute write — after which the
+    filesystem driver is caching structures for a volume whose bytes we are still
+    overwriting, and every config file written afterwards reads back as garbage.
+    Leaving sector 0 zeroed means Windows sees an unpartitioned disk and has
+    nothing to mount until we are finished.
+
+    `diskpart clean` does not cover this — it dismounts what was there, not what
+    our own write is about to create. Set-Disk -IsOffline does not either: it
+    silently no-ops on removable media."""
+    def aligned(b: bytes) -> bytes:  # raw device writes must be sector-aligned
+        return b + b"\0" * (-len(b) % SECTOR)
+
     with lzma.open(img_xz, "rb") as src, open(device, "rb+", buffering=0) as dst:
+        head = src.read(CHUNK)
+        if len(head) < SECTOR:
+            raise OSError(f"{img_xz.name} is too small to be a disk image.")
+        mbr, head = head[:SECTOR], head[SECTOR:]
+        dst.write(b"\0" * SECTOR)  # placeholder; the real one goes on at the end
+        dst.write(aligned(head))
+        written = SECTOR + len(head)
         while chunk := src.read(CHUNK):
-            if len(chunk) % SECTOR:  # raw device writes must be sector-aligned
-                chunk += b"\0" * (SECTOR - len(chunk) % SECTOR)
-            dst.write(chunk)
+            dst.write(aligned(chunk))
             written += len(chunk)
             progress(f"Writing {written >> 20} MB")
+        dst.flush()
+        os.fsync(dst.fileno())
+
+        dst.seek(0)
+        dst.write(mbr)
         dst.flush()
         os.fsync(dst.fileno())
     progress(f"Wrote {written >> 20} MB")
@@ -689,6 +726,8 @@ def bake(cfg: Config, number: int, progress) -> Path:
     boot = wait_for_boot_partition(before)
     progress(f"Writing config to {boot}")
     build(cfg, boot)
+    verify_config(cfg, boot)
+    progress(f"Verified config on {boot}")
     return boot
 
 
@@ -932,6 +971,50 @@ def _selftest_download() -> None:
     assert body == data and seen == [f"bytes={len(data)}-"], (len(body), seen)
 
 
+def _selftest_write_image() -> None:
+    """The image must land byte-exact, with sector 0 written last.
+
+    Writing the partition table first is what let Windows mount bootfs mid-write
+    and corrupt every config file that followed. A plain file stands in for the
+    device — same open("rb+") path, same fsync."""
+    import tempfile
+
+    # Must exceed CHUNK, or the write loop never iterates and the "mid-write"
+    # snapshot below is really a post-write one — which is how this test first
+    # fooled itself.
+    src = bytes(range(256)) * 36_864  # 9 MiB, and obviously ordered
+    with tempfile.TemporaryDirectory() as d:
+        xz = Path(d) / "img.xz"
+        xz.write_bytes(lzma.compress(src))
+        dev = Path(d) / "device.bin"
+        dev.write_bytes(b"\xee" * len(src))  # pre-existing junk, as on a used card
+
+        # mid-write the partition table must still be absent, so snapshot then
+        seen = {}
+
+        def progress(text, frac=None):
+            seen.setdefault("first_sector_during", dev.read_bytes()[:SECTOR])
+
+        write_image(xz, str(dev), progress)
+
+        assert dev.read_bytes() == src, "image did not land byte-exact"
+        if "first_sector_during" in seen:
+            assert seen["first_sector_during"] == b"\0" * SECTOR, \
+                "partition table appeared before the write finished"
+
+    # a file too short to hold a partition table is not a disk image
+    with tempfile.TemporaryDirectory() as d:
+        xz = Path(d) / "tiny.xz"
+        xz.write_bytes(lzma.compress(b"nope"))
+        dev = Path(d) / "device.bin"
+        dev.write_bytes(b"\0" * SECTOR)
+        try:
+            write_image(xz, str(dev), lambda *a, **k: None)
+            raise AssertionError("should reject an undersized image")
+        except OSError as exc:
+            assert "too small" in str(exc), exc
+
+
 def selftest() -> None:
     cfg = Config(password="p'w$1", root_password="r\"t", wifi_ssid="my net",
                  wifi_password="hunter2")
@@ -998,6 +1081,7 @@ def selftest() -> None:
                                    "Size": 1e10, "BusType": "SD"}))  # single = dict
 
     _selftest_download()
+    _selftest_write_image()
 
     import tempfile
     with tempfile.TemporaryDirectory() as d:
@@ -1027,6 +1111,16 @@ def selftest() -> None:
         assert cfgtxt.endswith("[all]\nkernel=kernel8.img\n") and "dtparam=nvme" in cfgtxt
 
         assert build(wired, boot) == ["firstrun.sh", "cmdline.txt", "ssh"]  # idempotent
+
+        # a good write reads back identical; a mangled one must be caught here
+        verify_config(wired, boot)
+        (boot / "firstrun.sh").write_text("truncated by a stale mount\n")
+        try:
+            verify_config(wired, boot)
+            raise AssertionError("should notice firstrun.sh read back wrong")
+        except OSError as exc:
+            assert "did not store what we sent it" in str(exc), exc
+        build(wired, boot)  # put it back
 
         # a corrupt cmdline.txt must stop the bake, not get our args appended to it
         (boot / "cmdline.txt").write_bytes(b"\xfb\x2c\x0b\x4d\xfc\x2c\x0b\x4d" * 8)
