@@ -19,4 +19,13 @@ $py = Resolve-Path .venv\Scripts\python.exe
 & $py -m PyInstaller --noconfirm --clean --onefile --noconsole --uac-admin `
     --name pxbake pxbake.py
 
-Write-Host "`nBuilt: $(Resolve-Path dist\pxbake.exe)" -ForegroundColor Green
+# $ErrorActionPreference only traps cmdlets, not native exit codes — without this
+# a failed build still printed "Built:" and pointed at the previous exe. Which it
+# did, twice, while pxbake.exe was locked by a still-running elevated instance.
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
+
+$exe = Get-Item dist\pxbake.exe
+if ($exe.LastWriteTime -lt (Get-Date).AddMinutes(-2)) {
+    throw "dist\pxbake.exe is stale ($($exe.LastWriteTime)) - is a copy still running?"
+}
+Write-Host "`nBuilt: $($exe.FullName)  [$($exe.LastWriteTime)]" -ForegroundColor Green
