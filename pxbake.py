@@ -34,8 +34,30 @@ PXVIRT_REPO = "https://mirrors.lierfang.com/pxcloud/pxvirt"
 PXVIRT_KEY = f"{PXVIRT_REPO}/pveport.gpg"
 KEYRING = "/usr/share/keyrings/pxvirt.gpg"
 
-RPIOS_URL = "https://downloads.raspberrypi.com/raspios_lite_arm64_latest"
-RPIOS_SHA_URL = f"{RPIOS_URL}.sha256"
+_RPI = "https://downloads.raspberrypi.com"
+# arm64 only — PXVIRT has no 32-bit build, so offering armhf would just be a
+# guaranteed failure three reboots later. Bookworm is listed because PXVIRT 8
+# carries far more arm64 packages than the trixie suite does.
+IMAGES = [
+    ("Raspberry Pi OS Lite 64-bit (Trixie)", f"{_RPI}/raspios_lite_arm64_latest"),
+    ("Raspberry Pi OS Lite 64-bit (Bookworm)",
+     f"{_RPI}/raspios_oldstable_lite_arm64_latest"),
+    ("Raspberry Pi OS 64-bit, desktop (Trixie)", f"{_RPI}/raspios_arm64_latest"),
+    ("Raspberry Pi OS 64-bit, desktop (Bookworm)",
+     f"{_RPI}/raspios_oldstable_arm64_latest"),
+]
+LOCAL_IMAGE = "Local file…"
+
+SETTINGS_NAME = "settings.json"
+
+# What the GUI shows, in order. bake() reports against these keys.
+STEPS = [
+    ("image", "Get the image"),
+    ("erase", "Erase the card"),
+    ("write", "Write the image"),
+    ("config", "Write the config"),
+    ("verify", "Verify"),
+]
 
 # LXC needs these or container memory/cpu accounting reads zero. They stay in
 # cmdline.txt forever, unlike the systemd.run hooks stage 1 cleans up.
@@ -567,17 +589,31 @@ def is_admin() -> bool:
         return False
 
 
-def download_image(progress) -> Path:
-    """Fetch Raspberry Pi OS Lite arm64, cached and checksum-verified."""
-    sha_line = urllib.request.urlopen(RPIOS_SHA_URL, timeout=60).read().decode()
+def resolve_image(source: str, progress) -> Path:
+    """A URL to fetch, or a path to an image already on disk."""
+    if not source.lower().startswith(("http://", "https://")):
+        path = Path(source)
+        if not path.is_file():
+            raise FileNotFoundError(f"No such image file: {path}")
+        if path.suffix.lower() not in (".img", ".xz"):
+            raise OSError(f"{path.name} is not a .img or .img.xz.")
+        progress("image", f"Using {path.name} ({path.stat().st_size >> 20} MB)", 1.0)
+        return path
+    return download_image(source, progress)
+
+
+def download_image(url: str, progress) -> Path:
+    """Fetch a Raspberry Pi OS image, cached and checksum-verified."""
+    progress("image", "Looking up the current image…", None)
+    sha_line = urllib.request.urlopen(f"{url}.sha256", timeout=60).read().decode()
     expected, name = sha_line.split()[0], sha_line.split()[1].strip("*")
     dest = cache_dir() / name
 
-    if dest.exists() and _sha256(dest, progress, "verifying cached") == expected:
-        progress(f"Using cached {name}")
+    if dest.exists() and _sha256(dest, progress, f"Checking cached {name}") == expected:
+        progress("image", f"Using cached {name}", 1.0)
         return dest
 
-    progress(f"Downloading {name}")
+    progress("image", f"Downloading {name}", 0.0)
     tmp = dest.with_suffix(dest.suffix + ".part")
     # Half a gigabyte over one socket; a single stall shouldn't cost the lot.
     # Resume from what's on disk with a Range request, and if the server ignores
@@ -585,7 +621,7 @@ def download_image(progress) -> Path:
     # a second copy onto the first.
     for attempt in range(1, RETRIES + 1):
         have = tmp.stat().st_size if tmp.exists() else 0
-        req = urllib.request.Request(RPIOS_URL)
+        req = urllib.request.Request(url)
         if have:
             req.add_header("Range", f"bytes={have}-")
         try:
@@ -598,7 +634,9 @@ def download_image(progress) -> Path:
                     while chunk := r.read(CHUNK):
                         f.write(chunk)
                         done += len(chunk)
-                        progress(f"Downloading {done >> 20} / {total >> 20} MB",
+                        progress("image",
+                                 f"Downloading {name} — {done >> 20} of "
+                                 f"{total >> 20} MB",
                                  done / total if total else None)
             break
         except urllib.error.HTTPError as exc:
@@ -608,14 +646,15 @@ def download_image(progress) -> Path:
         except OSError as exc:  # TimeoutError and URLError are both OSError
             if attempt == RETRIES:
                 raise
-            progress(f"Stalled at {tmp.stat().st_size >> 20} MB ({exc}) — "
-                     f"resuming, attempt {attempt + 1}/{RETRIES}")
+            progress("image", f"Stalled at {tmp.stat().st_size >> 20} MB — "
+                              f"resuming, attempt {attempt + 1} of {RETRIES}", None)
             time.sleep(2)
 
-    if _sha256(tmp, progress, "verifying") != expected:
+    if _sha256(tmp, progress, f"Checking {name}") != expected:
         tmp.unlink()
         raise OSError("Downloaded image failed its SHA-256 check. Try again.")
     tmp.replace(dest)
+    progress("image", f"Downloaded and verified {name}", 1.0)
     return dest
 
 
@@ -626,7 +665,8 @@ def _sha256(path: Path, progress, label: str) -> str:
         while chunk := f.read(CHUNK):
             h.update(chunk)
             done += len(chunk)
-            progress(f"{label} ({done >> 20} / {total >> 20} MB)", done / total)
+            progress("image", f"{label} — {done >> 20} of {total >> 20} MB",
+                     done / total)
     return h.hexdigest()
 
 
@@ -673,7 +713,8 @@ def write_image(img_xz: Path, device: str, progress) -> None:
     def aligned(b: bytes) -> bytes:  # raw device writes must be sector-aligned
         return b + b"\0" * (-len(b) % SECTOR)
 
-    with lzma.open(img_xz, "rb") as src, open(device, "rb+", buffering=0) as dst:
+    opener = lzma.open if img_xz.suffix.lower() == ".xz" else open
+    with opener(img_xz, "rb") as src, open(device, "rb+", buffering=0) as dst:
         head = src.read(CHUNK)
         if len(head) < SECTOR:
             raise OSError(f"{img_xz.name} is too small to be a disk image.")
@@ -684,7 +725,7 @@ def write_image(img_xz: Path, device: str, progress) -> None:
         while chunk := src.read(CHUNK):
             dst.write(aligned(chunk))
             written += len(chunk)
-            progress(f"Writing {written >> 20} MB")
+            progress("write", f"Writing {written >> 20} MB", None)
         dst.flush()
         os.fsync(dst.fileno())
 
@@ -692,7 +733,7 @@ def write_image(img_xz: Path, device: str, progress) -> None:
         dst.write(mbr)
         dst.flush()
         os.fsync(dst.fileno())
-    progress(f"Wrote {written >> 20} MB")
+    progress("write", f"Wrote {written >> 20} MB", 1.0)
 
 
 def wait_for_boot_partition(before: set, timeout: int = 90, poll=None) -> Path:
@@ -710,25 +751,60 @@ def wait_for_boot_partition(before: set, timeout: int = 90, poll=None) -> Path:
         "Re-plug the card, then run pxbake again and pick the boot partition.")
 
 
-def bake(cfg: Config, number: int, progress) -> Path:
-    """Download, flash, configure. Destroys everything on the chosen disk."""
+def bake(cfg: Config, number: int, source: str, progress) -> Path:
+    """Fetch, flash, configure. Destroys everything on the chosen disk."""
     if not is_admin():
         raise PermissionError(
             "Writing a raw disk needs Administrator. Right-click pxbake and "
             "'Run as administrator', or pick an already-flashed boot partition.")
-    img = download_image(progress)
+    img = resolve_image(source, progress)
+
     before = set(find_boot_partitions())
-    progress(f"Erasing disk {number}")
+    progress("erase", f"Erasing disk {number}…", None)
     wipe_disk(number)
+    progress("erase", f"Erased disk {number}", 1.0)
+
+    progress("write", "Writing the image…", None)
     write_image(img, rf"\\.\PhysicalDrive{number}", progress)
-    progress("Waiting for the card to remount")
+
+    progress("config", "Waiting for the card to remount…", None)
     _ps("Update-HostStorageCache")
     boot = wait_for_boot_partition(before)
-    progress(f"Writing config to {boot}")
     build(cfg, boot)
+    progress("config", f"Wrote the config to {boot}", 1.0)
+
+    progress("verify", "Reading it back…", None)
     verify_config(cfg, boot)
-    progress(f"Verified config on {boot}")
+    progress("verify", f"Verified — {boot} matches what we sent", 1.0)
     return boot
+
+
+# ------------------------------------------------------------------- settings
+
+def settings_path() -> Path:
+    return cache_dir() / SETTINGS_NAME
+
+
+def save_settings(cfg: Config, source: str) -> None:
+    """Remember the form between runs — everything except the passwords.
+
+    ponytail: secrets deliberately not persisted. They'd be plaintext on disk
+    forever, to save typing them once per card."""
+    data = {k: getattr(cfg, k) for k, _, _ in FIELDS if k not in SECRET_FIELDS}
+    data["ssh"] = cfg.ssh
+    data["image"] = source
+    try:
+        settings_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass  # a settings file we can't write is not worth failing a bake over
+
+
+def load_settings() -> dict:
+    try:
+        data = json.loads(settings_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 # --------------------------------------------------------------------------- GUI
@@ -753,8 +829,9 @@ def list_targets() -> list[Target]:
 
 def gui() -> None:
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import filedialog, messagebox, ttk
 
+    saved = load_settings()
     root = tk.Tk()
     root.title("pxbake")
     root.resizable(False, False)
@@ -762,49 +839,147 @@ def gui() -> None:
     frm.grid()
 
     ttk.Label(frm, text="PXVIRT on a Raspberry Pi. Fill in, bake, boot.",
-              font=("", 10, "bold")).grid(row=0, column=0, columnspan=2,
+              font=("", 10, "bold")).grid(row=0, column=0, columnspan=3,
                                           sticky="w", pady=(0, 10))
 
     entries = {}
     for i, (key, label, default) in enumerate(FIELDS, start=1):
         ttk.Label(frm, text=label).grid(row=i, column=0, sticky="e", padx=(0, 8), pady=2)
-        e = ttk.Entry(frm, width=38, show="*" if key in SECRET_FIELDS else "")
-        e.insert(0, default)
-        e.grid(row=i, column=1, sticky="we", pady=2)
+        e = ttk.Entry(frm, width=40, show="*" if key in SECRET_FIELDS else "")
+        e.insert(0, "" if key in SECRET_FIELDS else str(saved.get(key, default)))
+        e.grid(row=i, column=1, columnspan=2, sticky="we", pady=2)
         entries[key] = e
 
     row = len(FIELDS) + 1
-    ssh_var = tk.BooleanVar(value=True)
+    ssh_var = tk.BooleanVar(value=bool(saved.get("ssh", True)))
     ttk.Checkbutton(frm, text="Enable SSH", variable=ssh_var).grid(
         row=row, column=1, sticky="w", pady=(6, 2))
 
+    # -- image source ---------------------------------------------------------
+    row += 1
+    ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=3,
+                                                 sticky="we", pady=(8, 6))
+    row += 1
+    ttk.Label(frm, text="Image").grid(row=row, column=0, sticky="e", padx=(0, 8))
+    image_labels = [lbl for lbl, _ in IMAGES] + [LOCAL_IMAGE]
+    image_combo = ttk.Combobox(frm, width=34, state="readonly", values=image_labels)
+    image_combo.grid(row=row, column=1, sticky="we", pady=2)
+    local_path = tk.StringVar()
+
+    saved_image = saved.get("image", "")
+    if saved_image and not saved_image.startswith("http"):
+        image_combo.set(LOCAL_IMAGE)
+        local_path.set(saved_image)
+    else:
+        match = [i for i, (_, u) in enumerate(IMAGES) if u == saved_image]
+        image_combo.current(match[0] if match else 0)
+
+    def on_browse():
+        p = filedialog.askopenfilename(
+            title="Pick a Raspberry Pi image",
+            filetypes=[("Pi images", "*.img *.img.xz *.xz"), ("All files", "*.*")])
+        if p:
+            local_path.set(p)
+            image_combo.set(LOCAL_IMAGE)
+            image_note.config(text=Path(p).name)
+
+    browse = ttk.Button(frm, text="Browse…", command=on_browse, width=10)
+    browse.grid(row=row, column=2, sticky="we", padx=(6, 0))
+
+    row += 1
+    image_note = ttk.Label(frm, text="", foreground="grey40", wraplength=300)
+    image_note.grid(row=row, column=1, columnspan=2, sticky="w")
+
+    def chosen_image() -> str:
+        """The URL to fetch, or the path to a local file."""
+        if image_combo.get() == LOCAL_IMAGE:
+            return local_path.get()
+        return dict(IMAGES)[image_combo.get()]
+
+    def on_image_change(_=None):
+        if image_combo.get() == LOCAL_IMAGE:
+            image_note.config(text=Path(local_path.get()).name if local_path.get()
+                              else "Pick a .img or .img.xz with Browse…")
+        else:
+            image_note.config(text="Downloaded once, then cached and reused.")
+
+    image_combo.bind("<<ComboboxSelected>>", on_image_change)
+    on_image_change()
+
+    # -- target ---------------------------------------------------------------
     row += 1
     ttk.Label(frm, text="Target").grid(row=row, column=0, sticky="e", padx=(0, 8))
     targets = list_targets()
-    combo = ttk.Combobox(frm, width=36, state="readonly",
+    combo = ttk.Combobox(frm, width=34, state="readonly",
                          values=[t.label for t in targets])
     if targets:
         combo.current(0)
     combo.grid(row=row, column=1, sticky="we", pady=2)
+    refresh = ttk.Button(frm, text="Rescan", width=10)
+    refresh.grid(row=row, column=2, sticky="we", padx=(6, 0))
+
+    # -- steps ----------------------------------------------------------------
+    row += 1
+    ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=3,
+                                                 sticky="we", pady=(8, 6))
+    row += 1
+    steps_frame = ttk.Frame(frm)
+    steps_frame.grid(row=row, column=0, columnspan=3, sticky="we")
+    step_labels = {}
+    for n, (key, title) in enumerate(STEPS):
+        lbl = ttk.Label(steps_frame, text=f"  ·  {title}", foreground="grey55")
+        lbl.grid(row=n, column=0, sticky="w")
+        step_labels[key] = lbl
 
     row += 1
-    refresh = ttk.Button(frm, text="Rescan")
-    refresh.grid(row=row, column=1, sticky="w", pady=(2, 0))
-
-    row += 1
-    bar = ttk.Progressbar(frm, mode="determinate", length=340)
-    bar.grid(row=row, column=0, columnspan=2, sticky="we", pady=(10, 4))
+    bar = ttk.Progressbar(frm, mode="determinate", length=380)
+    bar.grid(row=row, column=0, columnspan=3, sticky="we", pady=(8, 4))
 
     row += 1
     status = ttk.Label(frm, text="Insert a card, or pick a flashed one.",
-                       wraplength=420, foreground="grey30")
-    status.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+                       wraplength=440, foreground="grey30")
+    status.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
     row += 1
-    bake_btn = ttk.Button(frm, text="Bake")
-    bake_btn.grid(row=row, column=0, columnspan=2, sticky="we", pady=(4, 0))
+    buttons = ttk.Frame(frm)
+    buttons.grid(row=row, column=0, columnspan=3, sticky="we", pady=(4, 0))
+    save_btn = ttk.Button(buttons, text="Save settings", width=16)
+    save_btn.pack(side="left")
+    bake_btn = ttk.Button(buttons, text="Bake")
+    bake_btn.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
     events: queue.Queue = queue.Queue()
+
+    def current_config() -> Config:
+        return Config(ssh=ssh_var.get(),
+                      **{k: entries[k].get().strip() for k, _, _ in FIELDS})
+
+    def on_save():
+        # Deliberately no validation — saving a half-filled form is the whole
+        # point of a Save button. Validation belongs on Bake.
+        save_settings(current_config(), chosen_image())
+        status.config(text=f"Settings saved to {settings_path()} — passwords are "
+                           f"not stored.", foreground="green4")
+
+    save_btn.config(command=on_save)
+
+    def reset_steps():
+        for key, title in STEPS:
+            step_labels[key].config(text=f"  ·  {title}", foreground="grey55")
+
+    def mark_steps(active: str, done: bool):
+        """Everything above the active step is finished, by construction."""
+        order = [k for k, _ in STEPS]
+        if active not in order:
+            return
+        here = order.index(active)
+        for n, (key, title) in enumerate(STEPS):
+            if n < here or (n == here and done):
+                step_labels[key].config(text=f"  ✓  {title}", foreground="green4")
+            elif n == here:
+                step_labels[key].config(text=f"  →  {title}", foreground="black")
+            else:
+                step_labels[key].config(text=f"  ·  {title}", foreground="grey55")
 
     def on_refresh():
         nonlocal targets
@@ -816,13 +991,22 @@ def gui() -> None:
 
     refresh.config(command=on_refresh)
 
+    def finish(kind: str):
+        bar.stop()
+        bar.config(mode="determinate", value=100 if kind == "done" else 0)
+        bake_btn.config(state="normal")
+        refresh.config(state="normal")
+        on_refresh()
+
     def pump():
         """Drain worker events on the Tk thread. Tk is not thread-safe."""
         try:
             while True:
-                kind, text, frac = events.get_nowait()
-                status.config(text=text,
-                              foreground={"err": "red3", "done": "green4"}.get(kind, "grey30"))
+                kind, step, text, frac = events.get_nowait()
+                status.config(text=text, foreground={
+                    "err": "red3", "done": "green4"}.get(kind, "grey30"))
+                if step:
+                    mark_steps(step, frac == 1.0)
                 if frac is None:
                     bar.config(mode="indeterminate")
                     bar.start(15)
@@ -830,11 +1014,7 @@ def gui() -> None:
                     bar.stop()
                     bar.config(mode="determinate", value=frac * 100)
                 if kind in ("done", "err"):
-                    bar.stop()
-                    bar.config(mode="determinate", value=100 if kind == "done" else 0)
-                    bake_btn.config(state="normal")
-                    refresh.config(state="normal")
-                    on_refresh()
+                    finish(kind)
         except queue.Empty:
             pass
         root.after(100, pump)
@@ -843,42 +1023,53 @@ def gui() -> None:
         if not targets:
             messagebox.showerror("No target", "No card found. Insert one and Rescan.")
             return
-        cfg = Config(ssh=ssh_var.get(),
-                     **{k: entries[k].get().strip() for k, _, _ in FIELDS})
-        if errs := validate(cfg):
+        cfg = current_config()
+        errs = validate(cfg)
+        if image_combo.get() == LOCAL_IMAGE and not local_path.get():
+            errs.append("Pick an image file, or choose one to download.")
+        if errs:
             messagebox.showerror("Fix these first", "\n".join(f"• {e}" for e in errs))
             return
+
+        source = chosen_image()
+        save_settings(cfg, source)
         target = targets[combo.current()]
 
         if target.boot is not None:
             try:
                 written = build(cfg, target.boot)
+                verify_config(cfg, target.boot)
             except OSError as exc:
                 messagebox.showerror("Bake failed", str(exc))
                 return
-            status.config(text=f"Wrote {', '.join(written)}. Eject, boot the Pi, "
-                               f"then https://{cfg.addr}:8006", foreground="green4")
+            reset_steps()
+            mark_steps("verify", True)
+            status.config(text=f"Wrote and verified {', '.join(written)}. Eject, "
+                               f"boot the Pi, then https://{cfg.addr}:8006",
+                          foreground="green4")
             return
 
         if not messagebox.askyesno(
                 "Erase this disk?",
                 f"{target.label}\n\nEverything on it will be destroyed, then "
-                f"Raspberry Pi OS is written and configured.\n\nContinue?"):
+                f"the image is written and configured.\n\nContinue?"):
             return
 
         bake_btn.config(state="disabled")
         refresh.config(state="disabled")
+        reset_steps()
 
-        def progress(text, frac=None):
-            events.put(("info", text, frac))
+        def progress(step, text, frac=None):
+            events.put(("info", step, text, frac))
 
         def worker():
             try:
-                bake(cfg, target.disk, progress)
-                events.put(("done", f"Done. Eject the card, boot the Pi, wait ~30 min, "
-                                    f"then https://{cfg.addr}:8006", 1.0))
+                bake(cfg, target.disk, source, progress)
+                events.put(("done", "verify",
+                            f"Done. Eject the card, boot the Pi, wait ~30 min, "
+                            f"then https://{cfg.addr}:8006", 1.0))
             except Exception as exc:
-                events.put(("err", f"{type(exc).__name__}: {exc}", 0.0))
+                events.put(("err", None, f"{type(exc).__name__}: {exc}", 0.0))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -944,7 +1135,8 @@ def _selftest_download() -> None:
                 urllib.request.urlopen = fake_urlopen
                 globals()["cache_dir"] = lambda: Path(d)
                 time.sleep = lambda _: None
-                got = download_image(lambda *a, **k: None)
+                got = download_image("https://example.invalid/img",
+                                     lambda *a, **k: None)
                 return got.read_bytes(), seen
             finally:
                 urllib.request.urlopen = real_open
@@ -992,7 +1184,7 @@ def _selftest_write_image() -> None:
         # mid-write the partition table must still be absent, so snapshot then
         seen = {}
 
-        def progress(text, frac=None):
+        def progress(step, text, frac=None):
             seen.setdefault("first_sector_during", dev.read_bytes()[:SECTOR])
 
         write_image(xz, str(dev), progress)
@@ -1013,6 +1205,63 @@ def _selftest_write_image() -> None:
             raise AssertionError("should reject an undersized image")
         except OSError as exc:
             assert "too small" in str(exc), exc
+
+
+def _selftest_settings_and_source() -> None:
+    """Settings must survive a round trip without ever storing a password."""
+    import tempfile
+
+    cfg = Config(hostname="node7", ip="10.0.0.9/24", gateway="10.0.0.1",
+                 password="secret-pi", root_password="secret-root",
+                 wifi_ssid="net", wifi_password="secret-wifi",
+                 cluster_peer="10.0.0.5", cluster_password="secret-peer",
+                 ssh=False)
+    real_cache = globals()["cache_dir"]
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            globals()["cache_dir"] = lambda: Path(d)
+            assert load_settings() == {}  # nothing saved yet
+            save_settings(cfg, IMAGES[1][1])
+            raw = settings_path().read_text(encoding="utf-8")
+            for secret in ("secret-pi", "secret-root", "secret-wifi", "secret-peer"):
+                assert secret not in raw, f"{secret} was written to disk"
+            got = load_settings()
+            assert got["hostname"] == "node7" and got["ip"] == "10.0.0.9/24"
+            assert got["cluster_peer"] == "10.0.0.5"   # peer address is not secret
+            assert got["ssh"] is False and got["image"] == IMAGES[1][1]
+
+            settings_path().write_text("{not json", encoding="utf-8")
+            assert load_settings() == {}  # a corrupt file must not stop the app
+
+            # a local image is used as-is; a URL goes to the downloader
+            img = Path(d) / "custom.img"
+            img.write_bytes(b"\0" * SECTOR)
+            assert resolve_image(str(img), lambda *a: None) == img
+            try:
+                resolve_image(str(Path(d) / "nope.img"), lambda *a: None)
+                raise AssertionError("should reject a path that isn't there")
+            except FileNotFoundError as exc:
+                assert "No such image" in str(exc), exc
+
+            notes = Path(d) / "notes.txt"
+            notes.touch()
+            try:
+                resolve_image(str(notes), lambda *a: None)
+                raise AssertionError("should reject a file that isn't an image")
+            except OSError as exc:
+                assert "not a .img" in str(exc), exc
+        finally:
+            globals()["cache_dir"] = real_cache
+
+    # an uncompressed .img must write too, not just .img.xz
+    with tempfile.TemporaryDirectory() as d:
+        src = bytes(range(256)) * 36_864
+        raw = Path(d) / "plain.img"
+        raw.write_bytes(src)
+        dev = Path(d) / "dev.bin"
+        dev.write_bytes(b"\xee" * len(src))
+        write_image(raw, str(dev), lambda *a, **k: None)
+        assert dev.read_bytes() == src, "plain .img did not land byte-exact"
 
 
 def selftest() -> None:
@@ -1082,6 +1331,7 @@ def selftest() -> None:
 
     _selftest_download()
     _selftest_write_image()
+    _selftest_settings_and_source()
 
     import tempfile
     with tempfile.TemporaryDirectory() as d:

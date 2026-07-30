@@ -23,10 +23,42 @@ network config, which does not screen-record. The commands in it are the ones
 
 1. Plug in an SD card or USB reader.
 2. Run `pxbake.exe` (or `python pxbake.py`).
-3. Fill in the form, pick your card under **Target**, hit **Bake**.
+3. Fill in the form, pick an **Image** and your card under **Target**, hit **Bake**.
 4. Eject, boot the Pi, wait. Long coffee — it's an `apt upgrade` plus a full
    virtualisation stack, over an SD card.
 5. `https://<your-ip>:8006`, user `root`, realm **Linux PAM**.
+
+It walks the five steps down the middle of the window — get the image, erase,
+write, configure, verify — ticking each off as it goes, so a long download or a
+slow card looks like progress rather than a hang.
+
+### Images
+
+Four official Raspberry Pi OS builds, or your own file:
+
+| Choice | Notes |
+| --- | --- |
+| Lite 64-bit (Trixie) | Newest. Pairs with PXVIRT 9. |
+| Lite 64-bit (Bookworm) | PXVIRT 8 — a much larger arm64 package set. |
+| Desktop 64-bit (Trixie / Bookworm) | If you want a GUI on the node too. |
+| `Local file…` | Any `.img` or `.img.xz` you already have. |
+
+All arm64, deliberately: PXVIRT has no 32-bit build, so listing an armhf image
+would only be a guaranteed failure three reboots later. Downloads are
+checksum-verified against the official `.sha256`, cached, and resumed if the
+connection drops.
+
+### Settings
+
+**Save settings** writes the form to `settings.json` next to the image cache, and
+it's reloaded next launch — so the second card doesn't mean retyping your subnet.
+Baking saves it too.
+
+**Passwords are never written.** Not the Pi user's, not root's, not the Wi-Fi
+key, not the cluster peer's. Saving to skip a bit of typing isn't worth
+plaintext credentials sitting on disk indefinitely; the four password fields
+start empty every launch. Everything else — hostname, addressing, username,
+Wi-Fi SSID, cluster peer, image choice, SSH toggle — comes back.
 
 Already flashed a card yourself? Its boot partition shows up in **Target** too,
 and picking it writes the config only — no download, no erase, two seconds.
