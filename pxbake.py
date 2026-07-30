@@ -736,19 +736,35 @@ def write_image(img_xz: Path, device: str, progress) -> None:
     progress("write", f"Wrote {written >> 20} MB", 1.0)
 
 
-def wait_for_boot_partition(before: set, timeout: int = 90, poll=None) -> Path:
-    """After flashing, wait for the OS to mount the new bootfs."""
+def volume_path(letter: str) -> Path:
+    return Path(f"{letter}:/")
+
+
+def wait_for_boot_partition(number: int, timeout: int = 180) -> Path:
+    """After flashing, wait for Windows to mount the boot partition of THIS disk.
+
+    Deliberately not "a drive letter that wasn't there before". Windows hands the
+    replacement volume the same letter the old one had, so re-baking a card that
+    already had a boot partition means the letter never looks new and the wait
+    never ends. Asking the disk which of its partitions has a letter is exact."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        for p in find_boot_partitions():
-            if p not in before:
-                return p
-        if poll:
-            poll()
+        try:
+            _ps("Update-HostStorageCache")
+            letters = _ps(f"Get-Partition -DiskNumber {number} | "
+                          f"Where-Object DriveLetter | "
+                          f"Select-Object -ExpandProperty DriveLetter").split()
+        except (subprocess.CalledProcessError, OSError):
+            letters = []
+        for letter in letters:
+            path = volume_path(letter)
+            if (path / "cmdline.txt").is_file():
+                return path
         time.sleep(2)
     raise TimeoutError(
-        "The card was written, but its boot partition never appeared.\n"
-        "Re-plug the card, then run pxbake again and pick the boot partition.")
+        f"Disk {number} was written, but no boot partition appeared on it.\n"
+        "Re-plug the card, then run pxbake again and pick the boot partition\n"
+        "to write just the config — the image is already on there.")
 
 
 def bake(cfg: Config, number: int, source: str, progress) -> Path:
@@ -759,7 +775,6 @@ def bake(cfg: Config, number: int, source: str, progress) -> Path:
             "'Run as administrator', or pick an already-flashed boot partition.")
     img = resolve_image(source, progress)
 
-    before = set(find_boot_partitions())
     progress("erase", f"Erasing disk {number}…", None)
     wipe_disk(number)
     progress("erase", f"Erased disk {number}", 1.0)
@@ -768,8 +783,7 @@ def bake(cfg: Config, number: int, source: str, progress) -> Path:
     write_image(img, rf"\\.\PhysicalDrive{number}", progress)
 
     progress("config", "Waiting for the card to remount…", None)
-    _ps("Update-HostStorageCache")
-    boot = wait_for_boot_partition(before)
+    boot = wait_for_boot_partition(number)
     build(cfg, boot)
     progress("config", f"Wrote the config to {boot}", 1.0)
 
@@ -1383,14 +1397,25 @@ def selftest() -> None:
         assert (boot / "cmdline.txt").read_text() == line
         assert (boot / "config.txt").read_text() == cfgtxt
 
-        # The new-partition wait must ignore partitions that were already there.
-        # Seed `before` with whatever is really plugged into this machine, or the
-        # test passes or fails depending on whether a card happens to be in.
+        # The wait must find the boot partition of the disk just written, even
+        # when Windows reuses the letter the old volume had — a card being
+        # re-baked always does, and a "new letter" check then waits forever.
+        empty = Path(d) / "empty"
+        empty.mkdir()
+        real_ps, real_vol = globals()["_ps"], globals()["volume_path"]
         try:
-            wait_for_boot_partition(set(find_boot_partitions()) | {boot}, timeout=1)
-            raise AssertionError("should have timed out on a known partition")
-        except TimeoutError:
-            pass
+            globals()["_ps"] = lambda s: "" if "Update-Host" in s else "E\nI"
+            globals()["volume_path"] = lambda c: {"E": empty, "I": boot}[c]
+            assert wait_for_boot_partition(5, timeout=5) == boot  # skips E:, takes I:
+
+            globals()["volume_path"] = lambda c: empty  # no cmdline.txt anywhere
+            try:
+                wait_for_boot_partition(5, timeout=1)
+                raise AssertionError("should time out when nothing has cmdline.txt")
+            except TimeoutError as exc:
+                assert "no boot partition appeared" in str(exc), exc
+        finally:
+            globals()["_ps"], globals()["volume_path"] = real_ps, real_vol
     print("selftest ok")
 
 
