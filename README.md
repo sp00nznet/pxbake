@@ -31,6 +31,11 @@ network config, which does not screen-record. The commands in it are the ones
 Already flashed a card yourself? Its boot partition shows up in **Target** too,
 and picking it writes the config only — no download, no erase, two seconds.
 
+**Joining an existing cluster?** Fill in **Cluster peer IP** and that node's root
+password and the Pi joins itself on the third boot, once PXVIRT is up and the
+bridge is settled. Leave it blank for a standalone node. See
+[cluster join](#cluster-join) for the caveats — there are some.
+
 **It will erase the disk you point it at.** Only USB, SD and MMC devices are ever
 listed, and anything Windows marks as a system or boot disk is filtered out
 before you see it, so your internal drives can't appear in the dropdown. You
@@ -98,6 +103,39 @@ password. Then it deletes itself and reboots.
 
 Two stages because stage 1 runs in a stripped-down boot target with no network.
 Trying to `apt install proxmox-ve` there is how you get a brick.
+
+### Cluster join
+
+Give it a peer IP and root password and there's a third stage,
+`pxbake-cluster.service`, which runs `pvecm add <peer> --use_ssh 1` on the boot
+*after* the install. Three deliberate choices in there:
+
+- **Third boot, not second.** `pvecm add` registers the node under whatever
+  address it holds at the time. Run it before the `vmbr0` handover and the
+  cluster records a link that stops existing a minute later. The unit is
+  `After=pxbake-install.service`, and since stage 2 ends in a reboot it simply
+  never gets its turn until the install is done.
+- **`ssh-keyscan` first.** `pvecm` shells out to `ssh`, which refuses to proceed
+  on an unknown host key and would otherwise hang forever with no output.
+- **`sshpass`.** `pvecm` prompts for the peer's root password on a tty. The only
+  alternative is authorising an SSH key on the peer beforehand, which pxbake has
+  no way to do from a card. The password is written `umask 077` to
+  `/root/.pxbake-peer-pw` and `shred`ed on success; on failure it stays for the
+  retry, so a peer password you care about is a peer password you should rotate
+  after.
+
+The unit carries `ConditionPathExists=!/etc/pve/corosync.conf`, so it no-ops the
+moment the node is in a cluster, and retries on the next boot if the join failed.
+`/var/log/pxbake-cluster.log` has the `set -x` trace either way.
+
+Two things it can't paper over. A node must be **empty** to join — fine for a
+fresh bake, fatal if you add VMs first. And joining a **stock x86 Proxmox VE**
+cluster is not something PXVIRT promises; mixed-architecture clustering is
+advertised between PXVIRT nodes. Same-major-version PXVIRT peers are the
+supported path.
+
+This is the one part of pxbake that hasn't been exercised at all — I have no
+second node to join. Treat it as a well-formed first attempt, watch the log.
 
 Going sideways? `/boot/firmware/pxbake-stage1.log` and
 `/var/log/pxbake-install.log` on the Pi. Both are `set -x`, so they're loud.
