@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -69,6 +70,7 @@ SECRET_FIELDS = {"password", "root_password", "wifi_password"}
 
 CHUNK = 4 << 20
 SECTOR = 512
+RETRIES = 5
 
 
 @dataclass
@@ -372,7 +374,11 @@ def _ps(script: str) -> str:
 
 
 def parse_disks(raw: str) -> list[dict]:
-    """Removable disks only, from Get-Disk JSON. Split out so it's testable."""
+    """Removable disks with media in them, from Get-Disk JSON.
+
+    An empty card reader still enumerates as a USB disk — Size 0, OperationalStatus
+    "No Media". Offering that as a target just fails later with a confusing error,
+    so drop it here and let Rescan pick the card up once it's seated."""
     if not raw.strip():
         return []
     data = json.loads(raw)
@@ -380,7 +386,9 @@ def parse_disks(raw: str) -> list[dict]:
         data = [data]
     return [d for d in data
             if d.get("BusType") in ("USB", "SD", "MMC")
-            and not d.get("IsSystem") and not d.get("IsBoot")]
+            and not d.get("IsSystem") and not d.get("IsBoot")
+            and (d.get("Size") or 0) > 0
+            and d.get("OperationalStatus") != "No Media"]
 
 
 def list_disks() -> list[dict]:
@@ -389,7 +397,7 @@ def list_disks() -> list[dict]:
     try:
         return parse_disks(_ps(
             "Get-Disk | Select-Object Number,FriendlyName,Size,BusType,IsSystem,"
-            "IsBoot | ConvertTo-Json -Compress"))
+            "IsBoot,OperationalStatus | ConvertTo-Json -Compress"))
     except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
         return []
 
@@ -434,14 +442,38 @@ def download_image(progress) -> Path:
 
     progress(f"Downloading {name}")
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with urllib.request.urlopen(RPIOS_URL, timeout=60) as r, open(tmp, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        done = 0
-        while chunk := r.read(CHUNK):
-            f.write(chunk)
-            done += len(chunk)
-            progress(f"Downloading {done >> 20} / {total >> 20} MB",
-                     done / total if total else None)
+    # Half a gigabyte over one socket; a single stall shouldn't cost the lot.
+    # Resume from what's on disk with a Range request, and if the server ignores
+    # it (200 rather than 206) fall back to starting over rather than appending
+    # a second copy onto the first.
+    for attempt in range(1, RETRIES + 1):
+        have = tmp.stat().st_size if tmp.exists() else 0
+        req = urllib.request.Request(RPIOS_URL)
+        if have:
+            req.add_header("Range", f"bytes={have}-")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                resuming = getattr(r, "status", 200) == 206
+                have = have if resuming else 0
+                total = have + int(r.headers.get("Content-Length") or 0)
+                with open(tmp, "ab" if resuming else "wb") as f:
+                    done = have
+                    while chunk := r.read(CHUNK):
+                        f.write(chunk)
+                        done += len(chunk)
+                        progress(f"Downloading {done >> 20} / {total >> 20} MB",
+                                 done / total if total else None)
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code != 416:
+                raise
+            break  # Range past the end: the .part is already whole, go verify it
+        except OSError as exc:  # TimeoutError and URLError are both OSError
+            if attempt == RETRIES:
+                raise
+            progress(f"Stalled at {tmp.stat().st_size >> 20} MB ({exc}) — "
+                     f"resuming, attempt {attempt + 1}/{RETRIES}")
+            time.sleep(2)
 
     if _sha256(tmp, progress, "verifying") != expected:
         tmp.unlink()
@@ -681,6 +713,88 @@ def gui() -> None:
 
 # ---------------------------------------------------------------------- selftest
 
+def _selftest_download() -> None:
+    """A stalled socket 90% through a 500 MB download must not cost the download.
+
+    Not hypothetical: the first real run died at 472/500 MB and started over.
+    Fakes the network rather than touching it, so this stays hermetic and fast."""
+    import io
+    import tempfile
+
+    data = b"pxbake" * 20_000
+    digest = hashlib.sha256(data).hexdigest()
+    sha_body = f"{digest}  test.img.xz\n".encode()
+
+    class Resp(io.BytesIO):
+        def __init__(self, payload, status=200):
+            super().__init__(payload)
+            self.status = status
+            self.headers = {"Content-Length": str(len(payload))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.close()
+
+    class Stalls(Resp):
+        """Hands over `limit` bytes, then behaves like a socket that hung."""
+        def __init__(self, payload, limit):
+            super().__init__(payload)
+            self.limit = limit
+
+        def read(self, n=-1):
+            if self.tell() >= self.limit:
+                raise TimeoutError("The read operation timed out")
+            return super().read(min(n, self.limit - self.tell()))
+
+    def run(second_response, preload=None):
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            url = req if isinstance(req, str) else req.full_url
+            if url.endswith(".sha256"):
+                return Resp(sha_body)
+            rng = None if isinstance(req, str) else req.get_header("Range")
+            seen.append(rng)
+            return Stalls(data, 40_000) if rng is None else second_response(rng)
+
+        real_open, real_cache, real_sleep = (
+            urllib.request.urlopen, globals()["cache_dir"], time.sleep)
+        with tempfile.TemporaryDirectory() as d:
+            if preload is not None:
+                (Path(d) / "test.img.xz.part").write_bytes(preload)
+            try:
+                urllib.request.urlopen = fake_urlopen
+                globals()["cache_dir"] = lambda: Path(d)
+                time.sleep = lambda _: None
+                got = download_image(lambda *a, **k: None)
+                return got.read_bytes(), seen
+            finally:
+                urllib.request.urlopen = real_open
+                globals()["cache_dir"] = real_cache
+                time.sleep = real_sleep
+
+    # a 206 resumes from exactly where the stall left off — no gap, no overlap
+    body, seen = run(lambda rng: Resp(data[int(rng.split("=")[1].rstrip("-")):],
+                                      status=206))
+    assert body == data, f"resumed download corrupt: {len(body)} vs {len(data)}"
+    assert seen == [None, "bytes=40000-"], seen
+
+    # a server that ignores Range answers 200 with the whole file; appending that
+    # to the 40 KB already on disk would produce a corrupt image, so start over
+    body, seen = run(lambda rng: Resp(data, status=200))
+    assert body == data, f"restart after ignored Range corrupt: {len(body)}"
+
+    # an already-complete .part asks for a range past the end and gets 416 —
+    # that means done, not broken, and must not burn every retry before failing
+    def http_416(_rng):
+        raise urllib.error.HTTPError("u", 416, "Range Not Satisfiable", {}, None)
+
+    body, seen = run(http_416, preload=data)
+    assert body == data and seen == [f"bytes={len(data)}-"], (len(body), seen)
+
+
 def selftest() -> None:
     cfg = Config(password="p'w$1", root_password="r\"t", wifi_ssid="my net",
                  wifi_password="hunter2")
@@ -711,19 +825,25 @@ def selftest() -> None:
     assert "$APT full-upgrade" not in s2 and "$APT dist-upgrade" not in s2
     assert "pve-edk2-firmware-aarch64" in s2
 
-    # never offer the disk Windows is running from
+    # never offer the disk Windows is running from, nor an empty card reader
     disks = parse_disks(json.dumps([
         {"Number": 0, "FriendlyName": "NVMe", "Size": 1e12, "BusType": "NVMe",
-         "IsSystem": True, "IsBoot": True},
+         "IsSystem": True, "IsBoot": True, "OperationalStatus": "Online"},
         {"Number": 1, "FriendlyName": "SanDisk", "Size": 3e10, "BusType": "USB",
-         "IsSystem": False, "IsBoot": False},
+         "IsSystem": False, "IsBoot": False, "OperationalStatus": "Online"},
         {"Number": 2, "FriendlyName": "USB but booted", "Size": 3e10,
-         "BusType": "USB", "IsSystem": False, "IsBoot": True},
+         "BusType": "USB", "IsSystem": False, "IsBoot": True,
+         "OperationalStatus": "Online"},
+        {"Number": 5, "FriendlyName": "Mass Storage Device", "Size": 0,
+         "BusType": "USB", "IsSystem": False, "IsBoot": False,
+         "OperationalStatus": "No Media"},
     ]))
     assert [d["Number"] for d in disks] == [1], disks
     assert parse_disks("") == []
     assert parse_disks(json.dumps({"Number": 3, "FriendlyName": "Lone SD",
                                    "Size": 1e10, "BusType": "SD"}))  # single = dict
+
+    _selftest_download()
 
     import tempfile
     with tempfile.TemporaryDirectory() as d:
