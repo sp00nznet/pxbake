@@ -215,6 +215,15 @@ python pxbake.py --selftest
 .\build_win32.ps1     # -> dist\pxbake.exe, ~11 MB, no Python needed
 ```
 
+Or take a prebuilt one from
+[Releases](https://github.com/sp00nznet/pxbake/releases). CI runs that same
+script on every push, so the published binary and a local build come from one
+definition rather than two that can drift. Cutting a release is just a tag:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
 PyInstaller is the only build-time dependency and it never ships inside the tool.
 The script builds in a local `.venv\` on purpose: PyInstaller flat-refuses to run
 if the obsolete `pathlib` backport is installed anywhere on the path, and plenty

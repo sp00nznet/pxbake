@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to attach binaries to a release
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Run this as its own step so a logic regression reports itself as a
+      # failed test rather than as a mysteriously failed build. build_win32.ps1
+      # runs it again; it takes about a second and the clear signal is worth it.
+      #
+      # There is no audit or lockfile step because pxbake has no runtime
+      # dependencies at all - standard library and Tk. The selftest fakes both
+      # the network and the disk, so it needs neither on a runner.
+      - name: selftest
+        run: python pxbake.py --selftest
+
+      # Deliberately the same script a developer runs locally, rather than a
+      # second build definition that can quietly drift from it. It builds in a
+      # clean venv (PyInstaller refuses to run if the obsolete `pathlib` backport
+      # is anywhere on the path) and fails if PyInstaller did not actually
+      # replace the exe - which is a real failure mode when a copy is running.
+      - name: build
+        run: .\build_win32.ps1
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pxbake-windows-x64
+          path: dist/pxbake.exe
+
+      # Only on a version tag: publish on the Releases page so people can
+      # download a build without installing Python or trusting a binary from
+      # anywhere else.
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: dist/pxbake.exe
+          generate_release_notes: true
