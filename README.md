@@ -1,5 +1,9 @@
 # pxbake
 
+[![build](https://github.com/sp00nznet/pxbake/actions/workflows/build.yml/badge.svg)](https://github.com/sp00nznet/pxbake/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/sp00nznet/pxbake)](https://github.com/sp00nznet/pxbake/releases)
+
 **Bake PXVIRT — Proxmox VE for ARM — into a Raspberry Pi SD card.**
 
 Pick a card. Fill in the form. Hit Bake. It downloads Raspberry Pi OS Lite,
@@ -253,9 +257,28 @@ Raspberry Pi 4 and 5, Raspberry Pi OS Lite 64-bit. Pi 3 works per the PXVIRT
 hardware notes, though 4 GB of RAM is the realistic floor. Older Pis are ARMv7 —
 no.
 
-The generator is covered by `--selftest` and every command it emits traces to the
-PXVIRT docs. It has not yet been through a full hardware run, so keep a monitor
-on the Pi for the first one and read the two logs.
+### What's proven, and what isn't
+
+Worth being precise about, because the two halves have had very different
+amounts of contact with reality.
+
+**Proven against real cards:** fetching and checksumming the image, erasing,
+writing, patching the config, and reading it back. That path found six of its own
+bugs on hardware that no unit test would have caught — a download with no resume,
+an empty card reader offered as a target, config writes never `fsync`ed, a
+LibreELEC card mistaken for Raspberry Pi OS, a partition table written first so
+Windows mounted the volume mid-write and corrupted everything after it, and a
+remount wait that hung because Windows reused the drive letter. A card produced
+by the current build has been inspected file by file and is byte-correct.
+
+**Not proven:** everything after you put the card in. Stage 1, the PXVIRT
+install, and the cluster join have never executed on a booted Pi — the test board
+died at bootloader level, for reasons entirely unrelated to anything here. The
+cluster join has never run at all.
+
+So: the card it writes is correct, and what happens next is untested. Keep a
+monitor on the Pi for the first boot and read
+`/boot/firmware/pxbake-stage1.log` and `/var/log/pxbake-install.log`.
 
 ## Licence
 
